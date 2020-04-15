@@ -4,9 +4,9 @@ POC of mirroring the wayland screen output to AirPlay 1.0 compatible device.
 
 ## Implementation
 
-Was implemented live with using multiple debugging tools on channels:
+Was implemented using multiple debugging tools on live stream on youtube:
 * I'mProgrammer (ЯжПрограммист): https://www.youtube.com/channel/UCQYMO66yI5ym0nItFHR-hLQ
-  * Report "Report: Compleated AirPlay Mirroring" (TODO: add link)
+  * Report "Report: Completed AirPlay Mirroring" (TODO: add link)
   * Streams playlist: [Stream: AirPlay Protocol Client implementation](https://www.youtube.com/watch?v=AoMQG_1Eb74&list=PLGjsYh2LROL41UHAH5XXPvHJAr3KARlq5)
 
 ## Author & support
