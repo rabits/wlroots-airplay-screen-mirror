@@ -1,0 +1,29 @@
+> curl -v http://miracast-sidescreen:7100/stream.xml
+*   Trying 192.168.30.243...
+* TCP_NODELAY set
+* Connected to miracast-sidescreen (192.168.30.243) port 7100 (#0)
+> GET /stream.xml HTTP/1.1
+> Host: miracast-sidescreen:7100
+> User-Agent: curl/7.58.0
+> Accept: */*
+>
+< HTTP/1.1 200 OK
+< Date: Mon, 23 Mar 2020 23:26:32 +0000
+< Content-Length: 384
+< Content-Type: text/x-apple-plist+xml
+<
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>height</key>
+<integer>720</integer>
+<key>refreshRate</key>
+<real>0.033333333333333333</real>
+<key>version</key>
+<string>220.68</string>
+<key>width</key>
+<integer>1280</integer>
+</dict>
+</plist>
+* Connection #0 to host miracast-sidescreen left intact

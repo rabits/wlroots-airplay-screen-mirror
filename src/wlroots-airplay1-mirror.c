@@ -1,0 +1,738 @@
+#define _POSIX_C_SOURCE 200112L
+
+#define _XOPEN_SOURCE 600 /* for usleep */
+#include <ctype.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <time.h>
+
+#include <wayland-client-protocol.h>
+#include "wlr-screencopy-unstable-v1-client-protocol.h"
+
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
+
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <errno.h>
+
+#include <sys/time.h>
+
+#define STREAM_FRAME_RATE 10
+#define STREAM_PIX_FMT    AV_PIX_FMT_YUV420P
+
+static int opt_output_num = 0;
+
+int output_socket = 0;
+FILE *output_file = NULL;
+FILE *output_stdout = NULL;
+
+static struct AVCodecContext *enc_ctx = NULL;
+static struct SwsContext *sws_ctx = NULL;
+
+static struct wl_shm *shm = NULL;
+static struct zwlr_screencopy_manager_v1 *screencopy_manager = NULL;
+const char *output_name = NULL;
+static struct wl_output *output = NULL;
+
+static struct {
+    struct wl_buffer *wl_buffer;
+    void *data;
+    enum wl_shm_format format;
+    int width, height, stride;
+    bool y_invert;
+    uint64_t start_pts;
+    uint64_t pts;
+} buffer;
+bool buffer_copy_done = false;
+
+static struct wl_buffer *create_shm_buffer(int32_t fmt,
+        int width, int height, int stride, void **data_out) {
+    int size = stride * height;
+
+    const char shm_name[] = "/scrcpy-capture-wlroots-airplay1-mirror";
+    int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    if( fd < 0 ) {
+        fprintf(stderr, "ERROR: shm_open failed %d\n", fd);
+        return NULL;
+    }
+    shm_unlink(shm_name);
+
+    int ret;
+    while( (ret = ftruncate(fd, size)) == EINTR ) {
+        // No-op
+    }
+    if( ret < 0 ) {
+        close(fd);
+        fprintf(stderr, "ERROR: ftruncate failed\n");
+        return NULL;
+    }
+
+    void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if( data == MAP_FAILED ) {
+        fprintf(stderr, "ERROR: mmap failed: %m\n");
+        close(fd);
+        return NULL;
+    }
+
+    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
+    close(fd);
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height,
+        stride, fmt);
+    wl_shm_pool_destroy(pool);
+
+    *data_out = data;
+    return buffer;
+}
+
+static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t format,
+        uint32_t width, uint32_t height, uint32_t stride) {
+    buffer.format = format;
+    buffer.width = width;
+    buffer.height = height;
+    buffer.stride = stride;
+
+    if( !buffer.wl_buffer ) {
+        buffer.wl_buffer =
+            create_shm_buffer(format, width, height, stride, &buffer.data);
+    }
+
+    if( buffer.wl_buffer == NULL ) {
+        fprintf(stderr, "ERROR: failed to create buffer\n");
+        exit(EXIT_FAILURE);
+    }
+
+    zwlr_screencopy_frame_v1_copy(frame, buffer.wl_buffer);
+}
+
+static void frame_handle_flags(void *data,
+        struct zwlr_screencopy_frame_v1 *frame, uint32_t flags) {
+    buffer.y_invert = flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT;
+}
+
+static void frame_handle_ready(void *data,
+        struct zwlr_screencopy_frame_v1 *frame, uint32_t tv_sec_hi,
+        uint32_t tv_sec_lo, uint32_t tv_nsec) {
+    buffer.pts = ((((uint64_t)tv_sec_hi) << 32) | tv_sec_lo) * 1000000000 + tv_nsec;
+    buffer_copy_done = true;
+}
+
+static void frame_handle_failed(void *data,
+        struct zwlr_screencopy_frame_v1 *frame) {
+    fprintf(stderr, "ERROR: failed to copy frame\n");
+    exit(EXIT_FAILURE);
+}
+
+static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
+    .buffer = frame_handle_buffer,
+    .flags = frame_handle_flags,
+    .ready = frame_handle_ready,
+    .failed = frame_handle_failed,
+};
+
+static void handle_global(void *data, struct wl_registry *registry,
+        uint32_t name, const char *interface, uint32_t version) {
+    if( strcmp(interface, wl_output_interface.name) == 0 && opt_output_num > 0 ) {
+        fprintf(stderr, "INFO: Using output: %s\n", interface);
+        output = wl_registry_bind(registry, name, &wl_output_interface, 1);
+        opt_output_num--;
+    } else if( strcmp(interface, wl_shm_interface.name) == 0 ) {
+        shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+    } else if( strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0 ) {
+        screencopy_manager = wl_registry_bind(registry, name,
+            &zwlr_screencopy_manager_v1_interface, 1);
+    }
+}
+
+static void handle_global_remove(void *data, struct wl_registry *registry,
+        uint32_t name) {
+    // Who cares?
+}
+
+static const struct wl_registry_listener registry_listener = {
+    .global = handle_global,
+    .global_remove = handle_global_remove,
+};
+
+static enum AVPixelFormat scrcpy_fmt_to_pixfmt(uint32_t fmt) {
+    switch (fmt) {
+    case WL_SHM_FORMAT_NV12: return AV_PIX_FMT_NV12;
+    case WL_SHM_FORMAT_ARGB8888: return AV_PIX_FMT_BGRA;
+    case WL_SHM_FORMAT_XRGB8888: return AV_PIX_FMT_BGR0;
+    case WL_SHM_FORMAT_ABGR8888: return AV_PIX_FMT_RGBA;
+    case WL_SHM_FORMAT_XBGR8888: return AV_PIX_FMT_RGB0;
+    case WL_SHM_FORMAT_RGBA8888: return AV_PIX_FMT_ABGR;
+    case WL_SHM_FORMAT_RGBX8888: return AV_PIX_FMT_0BGR;
+    case WL_SHM_FORMAT_BGRA8888: return AV_PIX_FMT_ARGB;
+    case WL_SHM_FORMAT_BGRX8888: return AV_PIX_FMT_0RGB;
+    default: return AV_PIX_FMT_NONE;
+    };
+}
+
+static void writeUInt32LE(uint8_t *buff, uint32_t buff_pos, uint32_t data32) {
+    buff[buff_pos] = (uint8_t) data32 & 0xff;
+    buff[buff_pos+1] = (uint8_t) (data32 >> 8) & 0xff;
+    buff[buff_pos+2] = (uint8_t) (data32 >> 16) & 0xff;
+    buff[buff_pos+3] = (uint8_t) (data32 >> 24) & 0xff;
+}
+
+static void writeFloat32LE(uint8_t *buff, uint32_t buff_pos, float data32) {
+    // TODO: probably will not work well somewhere
+    uint8_t *b = (uint8_t *) &buff[buff_pos];
+    uint8_t *p = (uint8_t *) &data32;
+#if defined (_M_IX86) || (defined (CPU_FAMILY) && (CPU_FAMILY == I80X86))
+    b[0] = p[3];
+    b[1] = p[2];
+    b[2] = p[1];
+    b[3] = p[0];
+#else
+    b[0] = p[0];
+    b[1] = p[1];
+    b[2] = p[2];
+    b[3] = p[3];
+#endif
+}
+
+static void writeUInt16LE(uint8_t *buff, uint32_t buff_pos, uint16_t data16) {
+    buff[buff_pos] = (uint8_t) data16 & 0xff;
+    buff[buff_pos+1] = (uint8_t) (data16 >> 8) & 0xff;
+}
+
+static void writeUInt16BE(uint8_t *buff, uint32_t buff_pos, uint16_t data16) {
+    buff[buff_pos] = (uint8_t) (data16 >> 8) & 0xff;
+    buff[buff_pos+1] = (uint8_t) data16 & 0xff;
+}
+
+static size_t find0001(const uint8_t *p, size_t left_size) {
+    char counter = 0;
+    for( size_t i = 0; i < left_size; ++i ) {
+        if( p[i] == 0 )
+            counter++;
+        else if( counter == 3 && p[i] == 1 ) {
+            return i+1;
+        } else 
+            counter = 0;
+    }
+    return -1;
+}
+
+uint8_t avcc_buff[1024];
+static size_t prepareAVCCData() {
+    // Read extradata annexb
+    uint8_t *sps = NULL;
+    uint8_t sps_size = 0;
+    uint8_t *pps = NULL;
+    uint8_t pps_size = 0;
+    char counter = 0;
+
+    size_t pos_sps = find0001(enc_ctx->extradata, enc_ctx->extradata_size);
+    sps = &enc_ctx->extradata[pos_sps];
+    size_t pos_pps = pos_sps + find0001(&enc_ctx->extradata[pos_sps], enc_ctx->extradata_size-pos_sps);
+    pps = &enc_ctx->extradata[pos_pps];
+    sps_size = pos_pps - pos_sps - 4;
+    fprintf(stderr, "DEBUG: Found sps: %ld, size: %d\n", pos_sps, sps_size);
+    for( size_t j = 0; j < sps_size; ++j )
+        fprintf(stderr, "0x%02x, ", (unsigned char)sps[j]);
+    fprintf(stderr, "\n");
+    pps_size = enc_ctx->extradata_size - pos_pps;
+    fprintf(stderr, "DEBUG: Found pps: %ld, size: %d\n", pos_pps, pps_size);
+    for( size_t j = 0; j < pps_size; ++j )
+        fprintf(stderr, "0x%02x, ", (unsigned char)pps[j]);
+    fprintf(stderr, "\n");
+
+    pos_pps = find0001(&enc_ctx->extradata[pos_pps], enc_ctx->extradata_size-pos_pps);
+    if( -1 != pos_pps ) {
+        fprintf(stderr, "ERROR: Found another nalu, it should not be here: %ld\n", pos_pps);
+        exit(1);
+    }
+
+    // Send codec data in avcc format
+    avcc_buff[0] = 0x01;  // version
+    avcc_buff[1] = sps[1]; // SPS profile
+    avcc_buff[2] = sps[2]; // SPS compatibility
+    avcc_buff[3] = sps[3]; // SPS level
+    avcc_buff[4] = 0xFC | 3; // reserved (6 bits), NULA length size - 1 (2 bits)
+    avcc_buff[5] = 0xE0 | 1; // reserved (3 bits), num of SPS (5 bits)
+    writeUInt16BE(avcc_buff, 6, sps_size); // 2 bytes for length of SPS in BE
+
+    // TODO: check buffer overload
+    memcpy(&avcc_buff[8], sps, sps_size); // data of SPS
+    
+    size_t pps_begin = 8+sps_size;
+    avcc_buff[pps_begin] = 0x01;  // num of PPS
+    writeUInt16BE(avcc_buff, pps_begin+1, pps_size);  // 2 bytes for length of PPS in BE
+    memcpy(&avcc_buff[pps_begin+3], pps, pps_size); // data of PPS
+
+    return pps_begin+3+pps_size;
+}
+
+const int HEADER_BUFF_SIZE = 128;
+uint8_t header_buff[128];
+static void prepareHeader(uint32_t payload_size, uint16_t type) {
+    // Clean buffer
+    memset(header_buff, 0x00, 128);
+
+    writeUInt32LE(header_buff, 0, payload_size); // 4 bytes Payload size
+    writeUInt16LE(header_buff, 4, type); // 2 bytes Payload type
+    writeUInt16LE(header_buff, 6, type == 0x02 ? 0x1e : 0x06 ); // 2 bytes Payload option (0x1e on heartbeat)
+
+    if( type == 0x02 ) // HEART_BEAT
+        return;
+
+    // Get current seconds and fraction
+    struct timeval ts;
+    gettimeofday(&ts, NULL);
+    writeUInt32LE(header_buff, 8, ts.tv_usec); // 4 bytes NTP Timestamp fraction
+    writeUInt32LE(header_buff, 12, ts.tv_sec); // 4 bytes NTP Timestamp seconds
+
+    /*fprintf(stderr, "DEBUG: data size: %u : ", payload_size);
+    for( size_t j = 0; j < 16; ++j )
+        fprintf(stderr, "%02x ", header_buff[j]);
+    fprintf(stderr, "\n");*/
+
+    // Write source screen WxH if type VIDEO_CODEC
+    if( type == 0x01 ) {
+        writeFloat32LE(header_buff, 16, 1920.0f); // 4 bytes Source screen width
+        writeFloat32LE(header_buff, 20, 1080.0f); // 4 bytes Source screen height
+    }
+
+    writeFloat32LE(header_buff, 40, 1920.0f); // 4 bytes Source screen width
+    writeFloat32LE(header_buff, 44, 1080.0f); // 4 bytes Source screen height
+
+    // 48 byte - float (REAL_SCREEN_WIDTH - SENT_SCREEN_WIDTH)/2
+    // Probably to add black boxes and center the picture horizontally
+    writeFloat32LE(header_buff, 48, 0.0f);
+    // 52 byte - float (REAL_SCREEN_HEIGHT - SENT_SCREEN_HEIGHT)/2
+    // Probably to add black boxes and center the picture vertically
+    writeFloat32LE(header_buff, 52, 0.0f);
+
+    // Send the supported picture size (could be gotten from "GET /stream.xml HTTP/1.1")
+    writeFloat32LE(header_buff, 56, 1920.0f); // 4 bytes Supported screen width
+    writeFloat32LE(header_buff, 60, 1080.0f); // 4 bytes Supported screen height
+}
+
+static void sendToOutputs(uint8_t *buffer, size_t num_bytes) {
+    if( output_socket != 0 )
+        send(output_socket, buffer, num_bytes, 0);
+    if( output_file )
+        fwrite(buffer, 1, num_bytes, output_file);
+    if( output_stdout )
+        fwrite(buffer, 1, num_bytes, output_stdout);
+}
+
+static void initMirroringConnection() {
+    // Read plist
+    // TODO: Generate plist dynamically
+    char plist_buf[1024] = {0};
+    FILE* fh = NULL;
+    fh = fopen("stream-mirror.bplist", "rb");
+    if( fh == NULL ) {
+        fprintf(stderr, "ERROR: unable to open 'stream-mirror.bplist' from current dir\n");
+        exit(1);
+    }
+    fprintf(stderr, "DEBUG: plist reading\n");
+    size_t plist_len = fread(plist_buf, 1, 1024, fh);
+    fprintf(stderr, "DEBUG: plist read done: len: %ld\n", plist_len);
+    fclose(fh);
+    fh = NULL;
+
+    // Create buffers for data
+    char data_len[32];
+    sprintf(data_len, "%ld\r\n\r\n", plist_len);
+    char buff[2048] = {0};
+
+    // Generate headers
+    const char *header = "POST /stream HTTP/1.1\r\n"
+        "User-Agent: wlroots-airplay/1.0.0\r\n"
+        "X-Apple-Device-ID: 0x7B:DE:DB:1F:BB:AB\r\n"
+        "X-Apple-Client-Name: WLRootsAirplay\r\n"
+        "X-Apple-ProtocolVersion: 1\r\n"
+        "Content-Type: application/x-apple-binary-plist\r\n"
+        "Content-Length: ";
+
+    strcat(buff, header);
+    strcat(buff, data_len);
+
+    // Send Headers
+    sendToOutputs(buff, strlen(header) + strlen(data_len));
+    // Send plist
+    sendToOutputs(plist_buf, plist_len);
+    fprintf(stderr, "DEBUG: Initialized airplay mirroring\n");
+}
+
+static const char usage[] =
+    "Usage: scrcpy-capture [options...]\n"
+    "\n"
+    "  -h              Show help message and quit.\n"
+    "  -o <output_num> Set the output number to capture.\n"
+    "  -a <address>    Send stream to airplay 1.0 device with specified address.\n"
+    "  -p <port>       Send stream to airplay 1.0 device with specified port (default 7100).\n"
+    "  -s              Output stream to stdout.\n"
+    "  -f <file_path>  Output stream to the specified file path.\n"
+    "  -c              Include cursors in the capture.\n";
+
+int main(int argc, char *argv[]) {
+    bool write_stdout = false;
+    bool with_cursor = false;
+    const char *file_path = NULL;
+    const char *airplay_address = NULL;
+    uint16_t airplay_port = 7100;
+
+    int c;
+
+    while( (c = getopt(argc, argv, "hf:o:a:p:sc")) != -1 ) {
+        switch( c ) {
+        case 'h':
+            printf("%s", usage);
+            return EXIT_SUCCESS;
+        case 'f':
+            file_path = optarg;
+            break;
+        case 'o':
+            opt_output_num = atoi(optarg);
+            break;
+        case 'a':
+            airplay_address = optarg;
+            break;
+        case 'p':
+            airplay_port = atoi(optarg);
+            break;
+        case 's':
+            write_stdout = true;
+            break;
+        case 'c':
+            with_cursor = true;
+            break;
+        case '?':
+            if( isprint(optopt) )
+              fprintf(stderr, "ERROR: Unknown option `-%c'.\n", optopt);
+            else
+              fprintf(stderr, "ERROR: Unknown option character `\\x%x'.\n", optopt);
+            return 1;
+        default:
+            break;
+        }
+    }
+
+    struct wl_display * display = wl_display_connect(NULL);
+    if( display == NULL ) {
+        fprintf(stderr, "ERROR: failed to create display: %m\n");
+        return EXIT_FAILURE;
+    }
+
+    struct wl_registry *registry = wl_display_get_registry(display);
+    wl_registry_add_listener(registry, &registry_listener, NULL);
+    wl_display_dispatch(display);
+    wl_display_roundtrip(display);
+
+    if( shm == NULL ) {
+        fprintf(stderr, "ERROR: compositor is missing wl_shm\n");
+        return EXIT_FAILURE;
+    }
+    if( screencopy_manager == NULL ) {
+        fprintf(stderr, "ERROR: compositor doesn't support wlr-screencopy-unstable-v1\n");
+        return EXIT_FAILURE;
+    }
+    if( output == NULL ) {
+        fprintf(stderr, "ERROR: no output available\n");
+        return EXIT_FAILURE;
+    }
+
+    struct zwlr_screencopy_frame_v1 *wl_frame =
+        zwlr_screencopy_manager_v1_capture_output(screencopy_manager, with_cursor, output);
+    zwlr_screencopy_frame_v1_add_listener(wl_frame, &frame_listener, NULL);
+
+    if( airplay_address ) {
+        // TODO: Check MDNS on airplay features and determine mirroring support
+        fprintf(stderr, "INFO: Writing stream to airplay 1.0 device: %s:%d\n", airplay_address, airplay_port);
+        // Create socket
+        if( (output_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0 ) { 
+            fprintf(stderr, "ERROR: Socket creation error\n"); 
+            return -1; 
+        }
+        int yes = 1;
+        if( setsockopt(output_socket, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) == -1 ) {
+            fprintf(stderr, "ERROR: Socket setsockopt TCP_NODELAY error\n");
+            return -1;
+        }
+
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(7100);
+        if( inet_pton(AF_INET, airplay_address, &serv_addr.sin_addr) <= 0 ) {
+            printf("Invalid address or address not supported\n");
+            return -1;
+        }
+        // Connect to socket
+        if( connect(output_socket, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0 ) {
+            printf("Connection Failed \n");
+            return -1;
+        }
+    }
+    if( file_path ) {
+        fprintf(stderr, "INFO: Writing stream to file: %s\n", file_path);
+        output_file = fopen(file_path, "wb");
+    }
+    if( write_stdout ) {
+        fprintf(stderr, "INFO: Writing stream to stdout\n");
+        output_stdout = stdout;
+    }
+
+    if( !output_file && !output_stdout && output_socket == 0 ) {
+        fprintf(stderr, "ERROR: No output is specified (check -s, -f, -a)\n");
+        exit(1);
+    }
+
+    // AVLIB INIT
+    const AVCodec *encoder = avcodec_find_encoder_by_name("libx264");
+    if( !encoder ) {
+        fprintf(stderr, "ERROR: Codec '%s' not found\n", "libx264");
+        exit(1);
+    }
+
+    enc_ctx = avcodec_alloc_context3(encoder);
+    if( !enc_ctx ) {
+        fprintf(stderr, "ERROR: Could not allocate video codec context\n");
+        exit(1);
+    }
+
+    AVPacket *pkt = av_packet_alloc();
+    if( !pkt )
+        exit(1);
+
+    while( !buffer_copy_done && wl_display_dispatch(display) != -1 ) {
+        // This space is intentionally left blank
+    }
+
+    /* put sample parameters */
+    enc_ctx->bit_rate = 4096000; // 2KB/sec
+    /* resolution must be a multiple of two */
+    enc_ctx->width = buffer.width;
+    enc_ctx->height = buffer.height;
+    /* frames per second */
+    enc_ctx->time_base = (AVRational){1, STREAM_FRAME_RATE};
+    enc_ctx->framerate = (AVRational){STREAM_FRAME_RATE, 1};
+
+    /* emit one intra frame every ten frames
+     * check frame pict_type before passing frame
+     * to encoder, if frame->pict_type is AV_PICTURE_TYPE_I
+     * then gop_size is ignored and the output of encoder
+     * will always be I frame irrespective to gop_size
+     */
+    enc_ctx->gop_size = 10;
+    enc_ctx->pix_fmt = STREAM_PIX_FMT;
+
+    if( encoder->id == AV_CODEC_ID_H264 ) {
+        enc_ctx->max_b_frames = 3;
+        av_opt_set(enc_ctx->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(enc_ctx->priv_data, "profile", "baseline", 0);
+        av_opt_set_int(enc_ctx->priv_data, "intra-refresh", 1, 0);
+        av_opt_set_int(enc_ctx->priv_data, "crf", 15, 0);
+        //av_opt_set(enc_ctx->priv_data, "x264-params", "vbv-maxrate=500000:vbv-bufsize=500:slice-max-size=1500:keyint=60", 0);
+        //av_opt_set(enc_ctx->priv_data, "x264opts", "no-mbtree:sliced-threads:sync-lookahead=0", 0);
+        enc_ctx->max_b_frames = 0;
+        enc_ctx->delay = 0;
+        enc_ctx->thread_count = 1;
+        enc_ctx->thread_type = FF_THREAD_SLICE;
+        enc_ctx->slices = 1;
+        enc_ctx->level = 40;
+        av_opt_set(enc_ctx->priv_data, "tune", "zerolatency", 0);
+    } else if( encoder->id == AV_CODEC_ID_MJPEG ) {
+        enc_ctx->max_b_frames = 0;
+        enc_ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+    }
+    enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    bool codec_data_refresh = true;
+
+    /* open it */
+    int ret;
+    ret = avcodec_open2(enc_ctx, encoder, NULL);
+    if( ret < 0 ) {
+        fprintf(stderr, "ERROR: Could not open codec: %s\n", av_err2str(ret));
+        exit(1);
+    }
+
+    AVFrame *frame = av_frame_alloc();
+    if( !frame ) {
+        fprintf(stderr, "ERROR: Could not allocate video frame\n");
+        exit(1);
+    }
+    frame->format = enc_ctx->pix_fmt;
+    frame->width  = enc_ctx->width;
+    frame->height = enc_ctx->height;
+
+    ret = av_frame_get_buffer(frame, 1);
+    if( ret < 0 ) {
+        fprintf(stderr, "ERROR: Could not allocate the video frame data\n");
+        exit(1);
+    }
+
+    initMirroringConnection();
+
+    struct timespec tm;
+    int64_t last_ts = 0;
+
+    do {
+        if( ! buffer_copy_done )
+            continue;
+
+        clock_gettime( CLOCK_REALTIME, &tm );
+        int64_t frame_ts = tm.tv_nsec + tm.tv_sec * 1000000000;
+
+        /* make sure the frame data is writable */
+        ret = av_frame_make_writable(frame);
+        if( ret < 0 )
+            exit(1);
+
+        // Convert from existing format to target one
+        sws_ctx = sws_getCachedContext(sws_ctx,
+            frame->width, frame->height, scrcpy_fmt_to_pixfmt(buffer.format),
+            frame->width, frame->height, STREAM_PIX_FMT, 0, NULL, NULL, NULL);
+        //int *inv_table, srcrange, *table, dstrange, brightness, contrast, saturation;
+        //sws_getColorspaceDetails(sws_ctx, &inv_table, &srcrange, &table, &dstrange, &brightness, &contrast, &saturation);
+        //sws_setColorspaceDetails(sws_ctx, inv_table, srcrange, table, 1, brightness, contrast, saturation);
+        uint8_t * inData[1] = { buffer.data };
+        int inLinesize[1] = { buffer.stride };
+
+        // Inverting Y axis if source buffer is inverted
+        if( buffer.y_invert ) {
+            inData[0] += inLinesize[0]*(frame->height-1);
+            inLinesize[0] = -inLinesize[0];
+        }
+
+        sws_scale(sws_ctx, (const uint8_t * const *)&inData, inLinesize, 0, frame->height, frame->data, frame->linesize);
+
+        frame->pts = buffer.pts;
+
+        if( !buffer.start_pts )
+            buffer.start_pts = frame->pts;
+
+        frame->pts = av_rescale_q(frame->pts - buffer.start_pts, (AVRational){ 1, 1000000000 }, enc_ctx->time_base);
+
+        // ENCODE
+        // TODO: use vaapi to improve encoding:
+        // https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/vaapi_encode.c
+        ret = avcodec_send_frame(enc_ctx, frame);
+        if( ret < 0 ) {
+            fprintf(stderr, "ERROR: sending a frame for encoding failed\n");
+            exit(1);
+        }
+
+        while( ret >= 0 ) {
+            ret = avcodec_receive_packet(enc_ctx, pkt);
+            if( ret == AVERROR(EAGAIN) || ret == AVERROR_EOF )
+                break;
+            else if( ret < 0 ) {
+                fprintf(stderr, "ERROR: encoding failed\n");
+                exit(1);
+            }
+
+            if( codec_data_refresh ) {
+                // Send ping
+                // TODO: send heart beat every second
+                prepareHeader(0, 0x02); // type HEART_BEAT
+                sendToOutputs(header_buff, HEADER_BUFF_SIZE);
+
+                // Send VIDEO_CODEC header
+                size_t avcc_len = prepareAVCCData();
+                prepareHeader(avcc_len, 0x01); // type VIDEO_CODEC
+                sendToOutputs(header_buff, HEADER_BUFF_SIZE);
+
+                // Send AVCC data
+                sendToOutputs(avcc_buff, avcc_len);
+
+                codec_data_refresh = false;
+            }
+            //fprintf(stderr, "DEBUG: extradata: %d, packet: %d\n", enc_ctx->extradata_size, pkt->size);
+
+            // Change nalu start to nalu size
+            uint8_t *pd = pkt->data;
+            size_t ps = pkt->size;
+            size_t pos_data = find0001(pd, ps);
+            size_t first_nalu = pos_data - 4; // To cut avcodec comments
+            while( -1 != pos_data ) {
+                size_t nalu_len;
+                //fprintf(stderr, "DEBUG: Found nalu data pos: %ld", pos_data);
+                pd = &pd[pos_data];
+                ps = ps - pos_data;
+                size_t pos_data2 = find0001(pd, ps);
+                if( -1 == pos_data2 ) {
+                    nalu_len = ps;
+                } else {
+                    // Minus 4 because find0001 returns end of nalu token
+                    nalu_len = pos_data2 - pos_data - 4;
+                }
+                //fprintf(stderr, ", size: %ld\n", nalu_len);
+                // BE size of the nalu buffer
+                pd[-1] = (uint8_t) nalu_len & 0xff;
+                pd[-2] = (uint8_t) (nalu_len >> 8) & 0xff;
+                pd[-3] = (uint8_t) (nalu_len >> 16) & 0xff;
+                pd[-4] = (uint8_t) (nalu_len >> 24) & 0xff;
+                pos_data = pos_data2;
+            }
+
+            prepareHeader(pkt->size - first_nalu, 0x00); // type VIDEO_DATA
+            sendToOutputs(header_buff, HEADER_BUFF_SIZE);
+
+            // Send packet data
+            sendToOutputs(&pkt->data[first_nalu], pkt->size - first_nalu);
+
+            av_packet_unref(pkt);
+        }
+        // ENCODE DONE
+
+        buffer_copy_done = false;
+
+        // Sleep for the next frame
+        // TODO: Multithreading capture/encoding to improve framerate
+        if( frame->pts != AV_NOPTS_VALUE ) {
+            clock_gettime( CLOCK_REALTIME, &tm );
+            int64_t curr_ts = tm.tv_nsec + tm.tv_sec * 1000000000;
+
+            if( last_ts != AV_NOPTS_VALUE ) {
+                // 100000 = 100msec == 0.1 sec = 10f/s
+                // 50000 = 50msec == 0.05 sec = 20f/s
+                // TODO: add fps option to specify required frames per second
+                int64_t delay = 50000 - (curr_ts - frame_ts)/1000;
+                
+                fprintf(stderr, "--> Frame ts: %ld, last_ts: %ld, additional delay: %ld\n", frame_ts, last_ts, delay);
+                if( delay > 0 && delay < 1000000 )
+                    usleep(delay);
+            }
+            last_ts = frame_ts;
+        }
+
+        zwlr_screencopy_frame_v1_destroy(wl_frame);
+
+        wl_frame = zwlr_screencopy_manager_v1_capture_output(screencopy_manager, with_cursor, output);
+        zwlr_screencopy_frame_v1_add_listener(wl_frame, &frame_listener, NULL);
+    } while( wl_display_dispatch(display) != -1 );
+
+    if( output_socket != 0 )
+        close(output_socket);
+    if( output_file )
+        fclose(output_file);
+    if( output_stdout )
+        fclose(output_stdout);
+
+    avcodec_free_context(&enc_ctx);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+
+    wl_buffer_destroy(buffer.wl_buffer);
+
+    return EXIT_SUCCESS;
+}
