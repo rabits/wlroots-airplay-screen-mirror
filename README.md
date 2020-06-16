@@ -6,7 +6,7 @@ POC of mirroring the wayland screen output to AirPlay 1.0 compatible device.
 
 Was implemented using multiple debugging tools on live stream on youtube:
 * I'mProgrammer (ЯжПрограммист): https://www.youtube.com/channel/UCQYMO66yI5ym0nItFHR-hLQ
-  * Report "Report: Completed AirPlay Mirroring" (TODO: add link)
+  * [Index: Learning AirPlay mirroring protocol](https://youtu.be/p_YjBJRcGM8)
   * Streams playlist: [Stream: AirPlay Protocol Client implementation](https://www.youtube.com/watch?v=AoMQG_1Eb74&list=PLGjsYh2LROL41UHAH5XXPvHJAr3KARlq5)
 
 ## Author & support
@@ -65,11 +65,24 @@ Bitcoin wallet: `3Hs7bXdEQ8Uja7RvsA29woA4Bh5d2Tx2sf`
   ...
   ```
 
+## TODO
+
+* Encryption of the stream
+* Support for AirPlay 2.0
+* Audio embedding
+* Locating the available AirPlay devices using mDNS (zeroconf, bonjour)
+* Use hardware encoding if available (VAAPI)
+* Test on the other AirPlay devices
+* Variable FPS option
+
 ## Tests
 
 It's a POC, but it could provide ~10-50 msec delay, depends on the framerate (set to 20fps) used.
 
-Tested with MiraScreen device, connected with WiFi N router and SwayWM 1.4.
+Tested with WiFi N router and SwayWM 1.4:
+* [MiraScreen E5S](https://mirascreen.com/collections/wireless-display/products/e5s-wireless-display)
+* [MiraScreen K6](https://mirascreen.com/collections/wireless-display/products/k6-wireless-display)
+* [MiraScreen G5 Plus](https://www.amazon.com/gp/product/B08395JKVM/)
 
 ## Additional info
 

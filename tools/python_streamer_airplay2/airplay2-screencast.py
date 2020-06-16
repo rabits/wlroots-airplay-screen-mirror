@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PublicKey,
 )
 
-from lib.rtsp.control import RTSPClient
+from rtsp import RTSPClient
 
 import plistlib
 import socket

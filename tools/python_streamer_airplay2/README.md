@@ -3,7 +3,7 @@
 Partially implemented airplay 2.0 protocol without fp-setup (fairplay) due to complexety of the
 client logic
 
-# HowTo
+## HowTo
 
 Check the script logic. You need to create venv and run the script (it will fail).
 ```
@@ -18,3 +18,8 @@ $ source .venv/bin/activate
 [venv]$ ./airplay2-screencast.py 192.168.30.243 7000
 ...
 ```
+
+## Credentials
+
+Partially used the RTSP client implementation with some changes to receive the data:
+* https://github.com/runtheops/rtsp-rtp
