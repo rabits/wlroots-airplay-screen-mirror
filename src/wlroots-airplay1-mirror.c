@@ -22,6 +22,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 
 #include <sys/socket.h>
@@ -32,8 +33,7 @@
 
 #include <sys/time.h>
 
-#define STREAM_FRAME_RATE 10
-#define STREAM_PIX_FMT    AV_PIX_FMT_YUV420P
+#define STREAM_FRAME_RATE 20
 
 static int opt_output_num = 0;
 
@@ -43,6 +43,7 @@ FILE *output_file = NULL;
 FILE *output_stdout = NULL;
 
 static struct AVCodecContext *enc_ctx = NULL;
+static AVBufferRef *hw_device_ctx = NULL;
 static struct SwsContext *sws_ctx = NULL;
 
 static struct wl_shm *shm = NULL;
@@ -73,11 +74,11 @@ static struct wl_buffer *create_shm_buffer(int32_t fmt,
     }
     shm_unlink(shm_name);
 
-    int ret;
-    while( (ret = ftruncate(fd, size)) == EINTR ) {
+    int err;
+    while( (err = ftruncate(fd, size)) == EINTR ) {
         // No-op
     }
-    if( ret < 0 ) {
+    if( err < 0 ) {
         close(fd);
         fprintf(stderr, "ERROR: ftruncate failed\n");
         return NULL;
@@ -168,6 +169,35 @@ static const struct wl_registry_listener registry_listener = {
     .global = handle_global,
     .global_remove = handle_global_remove,
 };
+
+static int set_hwframe_ctx(AVCodecContext *ctx, AVBufferRef *hw_device_ctx) {
+    AVBufferRef *hw_frames_ref;
+    AVHWFramesContext *frames_ctx = NULL;
+    int err = 0;
+
+    if( !(hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx)) ) {
+        fprintf(stderr, "Failed to create VAAPI frame context.\n");
+        return -1;
+    }
+    frames_ctx = (AVHWFramesContext *)(hw_frames_ref->data);
+    frames_ctx->format    = AV_PIX_FMT_VAAPI;
+    frames_ctx->sw_format = AV_PIX_FMT_NV12;
+    frames_ctx->width     = ctx->width;
+    frames_ctx->height    = ctx->height;
+    frames_ctx->initial_pool_size = 20;
+    if( (err = av_hwframe_ctx_init(hw_frames_ref)) < 0 ) {
+        fprintf(stderr, "Failed to initialize VAAPI frame context. "
+                "Error code: %s\n",av_err2str(err));
+        av_buffer_unref(&hw_frames_ref);
+        return err;
+    }
+    ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
+    if( !ctx->hw_frames_ctx )
+        err = AVERROR(ENOMEM);
+
+    av_buffer_unref(&hw_frames_ref);
+    return err;
+}
 
 static enum AVPixelFormat scrcpy_fmt_to_pixfmt(uint32_t fmt) {
     switch (fmt) {
@@ -389,6 +419,7 @@ static const char usage[] =
     "Usage: scrcpy-capture [options...]\n"
     "\n"
     "  -h                     Show help message and quit.\n"
+    "  -v <vaapi_dev>         Use VAAPI device to encode the frames.\n"
     "  -o <output_num>        Set the output number to capture.\n"
     "  -a <addr[:port]>,[...] Send stream to airplay 1.0 device with specified\n"
     "                         address:port list (separated by comma).\n"
@@ -399,16 +430,28 @@ static const char usage[] =
 int main(int argc, char *argv[]) {
     bool write_stdout = false;
     bool with_cursor = false;
+    bool use_hw = false;
+    int enc_pix_format = AV_PIX_FMT_YUV420P;
+    int frame_pix_format = AV_PIX_FMT_YUV420P;
+    const char *encoder_name = "libx264";
+    const char *hw_dev_path = NULL;
     const char *file_path = NULL;
     char *airplay_addresses = NULL;
 
     int c;
 
-    while( (c = getopt(argc, argv, "hf:o:a:p:sc")) != -1 ) {
+    while( (c = getopt(argc, argv, "hvf:o:a:p:sc")) != -1 ) {
         switch( c ) {
         case 'h':
             printf("%s", usage);
             return EXIT_SUCCESS;
+        case 'v':
+            encoder_name = "h264_vaapi";
+            enc_pix_format = AV_PIX_FMT_VAAPI;
+            frame_pix_format = AV_PIX_FMT_NV12;
+            use_hw = true;
+            hw_dev_path = optarg;
+            break;
         case 'f':
             file_path = optarg;
             break;
@@ -534,28 +577,39 @@ int main(int argc, char *argv[]) {
     }
 
     // AVLIB INIT
-    const AVCodec *encoder = avcodec_find_encoder_by_name("libx264");
+    int err;
+    if( use_hw ) {
+        err = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, hw_dev_path, NULL, 0);
+        if( err < 0 ) {
+            fprintf(stderr, "ERROR: Failed to create a VAAPI device. Error code: %s\n", av_err2str(err));
+            goto close;
+        }
+    }
+
+    AVFrame *frame = NULL, *hw_frame = NULL;
+    AVPacket *pkt = NULL;
+    const AVCodec *encoder = avcodec_find_encoder_by_name(encoder_name);
     if( !encoder ) {
-        fprintf(stderr, "ERROR: Codec '%s' not found\n", "libx264");
-        exit(1);
+        fprintf(stderr, "ERROR: Codec '%s' not found\n", encoder_name);
+        goto close;
     }
 
     enc_ctx = avcodec_alloc_context3(encoder);
     if( !enc_ctx ) {
         fprintf(stderr, "ERROR: Could not allocate video codec context\n");
-        exit(1);
+        goto close;
     }
 
-    AVPacket *pkt = av_packet_alloc();
+    pkt = av_packet_alloc();
     if( !pkt )
-        exit(1);
+        goto close;
 
     while( !buffer_copy_done && wl_display_dispatch(display) != -1 ) {
         // This space is intentionally left blank
     }
 
     /* put sample parameters */
-    enc_ctx->bit_rate = 4096000; // 2KB/sec
+    enc_ctx->bit_rate = 4096000;
     /* resolution must be a multiple of two */
     enc_ctx->width = buffer.width;
     enc_ctx->height = buffer.height;
@@ -570,10 +624,16 @@ int main(int argc, char *argv[]) {
      * will always be I frame irrespective to gop_size
      */
     enc_ctx->gop_size = 10;
-    enc_ctx->pix_fmt = STREAM_PIX_FMT;
+    enc_ctx->pix_fmt = enc_pix_format;
 
-    if( encoder->id == AV_CODEC_ID_H264 ) {
-        enc_ctx->max_b_frames = 3;
+    if( use_hw ) {
+        if( (err = set_hwframe_ctx(enc_ctx, hw_device_ctx)) < 0 ) {
+            fprintf(stderr, "ERROR: Failed to set hwframe context.\n");
+            goto close;
+        }
+    }
+
+    if( !use_hw && encoder->id == AV_CODEC_ID_H264 ) {
         av_opt_set(enc_ctx->priv_data, "preset", "ultrafast", 0);
         av_opt_set(enc_ctx->priv_data, "profile", "baseline", 0);
         av_opt_set_int(enc_ctx->priv_data, "intra-refresh", 1, 0);
@@ -587,34 +647,37 @@ int main(int argc, char *argv[]) {
         enc_ctx->slices = 1;
         enc_ctx->level = 40;
         av_opt_set(enc_ctx->priv_data, "tune", "zerolatency", 0);
-    } else if( encoder->id == AV_CODEC_ID_MJPEG ) {
-        enc_ctx->max_b_frames = 0;
-        enc_ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
     }
     enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     bool codec_data_refresh = true;
 
     /* open it */
-    int ret;
-    ret = avcodec_open2(enc_ctx, encoder, NULL);
-    if( ret < 0 ) {
-        fprintf(stderr, "ERROR: Could not open codec: %s\n", av_err2str(ret));
-        exit(1);
+    err = avcodec_open2(enc_ctx, encoder, NULL);
+    if( err < 0 ) {
+        fprintf(stderr, "ERROR: Could not open codec: %s\n", av_err2str(err));
+        goto close;
     }
 
-    AVFrame *frame = av_frame_alloc();
+/*    if( use_hw ) {
+        if( !(hw_frame = av_frame_alloc()) ) {
+            err = AVERROR(ENOMEM);
+            goto close;
+        }
+    }*/
+
+    frame = av_frame_alloc();
     if( !frame ) {
         fprintf(stderr, "ERROR: Could not allocate video frame\n");
-        exit(1);
+        goto close;
     }
-    frame->format = enc_ctx->pix_fmt;
+    frame->format = frame_pix_format;
     frame->width  = enc_ctx->width;
     frame->height = enc_ctx->height;
 
-    ret = av_frame_get_buffer(frame, 1);
-    if( ret < 0 ) {
+    err = av_frame_get_buffer(frame, 1);
+    if( err < 0 ) {
         fprintf(stderr, "ERROR: Could not allocate the video frame data\n");
-        exit(1);
+        goto close;
     }
 
     initMirroringConnection();
@@ -630,14 +693,14 @@ int main(int argc, char *argv[]) {
         int64_t frame_ts = tm.tv_nsec + tm.tv_sec * 1000000000;
 
         /* make sure the frame data is writable */
-        ret = av_frame_make_writable(frame);
-        if( ret < 0 )
-            exit(1);
+        err = av_frame_make_writable(frame);
+        if( err < 0 )
+            goto close;
 
         // Convert from existing format to target one
         sws_ctx = sws_getCachedContext(sws_ctx,
             frame->width, frame->height, scrcpy_fmt_to_pixfmt(buffer.format),
-            frame->width, frame->height, STREAM_PIX_FMT, 0, NULL, NULL, NULL);
+            frame->width, frame->height, frame_pix_format, 0, NULL, NULL, NULL);
         //int *inv_table, srcrange, *table, dstrange, brightness, contrast, saturation;
         //sws_getColorspaceDetails(sws_ctx, &inv_table, &srcrange, &table, &dstrange, &brightness, &contrast, &saturation);
         //sws_setColorspaceDetails(sws_ctx, inv_table, srcrange, table, 1, brightness, contrast, saturation);
@@ -660,23 +723,44 @@ int main(int argc, char *argv[]) {
         frame->pts = av_rescale_q(frame->pts - buffer.start_pts, (AVRational){ 1, 1000000000 }, enc_ctx->time_base);
 
         // ENCODE
-        // TODO: use vaapi to improve encoding:
-        // https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/vaapi_encode.c
-        ret = avcodec_send_frame(enc_ctx, frame);
-        if( ret < 0 ) {
-            fprintf(stderr, "ERROR: sending a frame for encoding failed\n");
-            exit(1);
+        if( use_hw ) {
+            if( !(hw_frame = av_frame_alloc()) ) {
+                err = AVERROR(ENOMEM);
+                goto close;
+            }
+            if( (err = av_hwframe_get_buffer(enc_ctx->hw_frames_ctx, hw_frame, 0)) < 0 ) {
+                fprintf(stderr, "Error code: %s.\n", av_err2str(err));
+                goto close;
+            }
+            if( !hw_frame->hw_frames_ctx ) {
+                err = AVERROR(ENOMEM);
+                goto close;
+            }
+            if( (err = av_hwframe_transfer_data(hw_frame, frame, 0)) < 0 ) {
+                fprintf(stderr, "Error while transferring frame data to surface."
+                        "Error code: %s.\n", av_err2str(err));
+                goto close;
+            }
+            err = avcodec_send_frame(enc_ctx, hw_frame);
+        } else
+            err = avcodec_send_frame(enc_ctx, frame);
+
+        if( err < 0 ) {
+            fprintf(stderr, "ERROR: sending a frame for encoding failed, Error code: %s\n", av_err2str(err));
+            goto close;
         }
 
-        while( ret >= 0 ) {
-            ret = avcodec_receive_packet(enc_ctx, pkt);
-            if( ret == AVERROR(EAGAIN) || ret == AVERROR_EOF )
+        // WRITE
+        while( err >= 0 ) {
+            err = avcodec_receive_packet(enc_ctx, pkt);
+            if( err == AVERROR(EAGAIN) || err == AVERROR_EOF )
                 break;
-            else if( ret < 0 ) {
+            else if( err < 0 ) {
                 fprintf(stderr, "ERROR: encoding failed\n");
-                exit(1);
+                goto close;
             }
 
+            fprintf(stderr, "DEBUG: extradata: %d, packet: %d\n", enc_ctx->extradata_size, pkt->size);
             if( codec_data_refresh ) {
                 // Send ping
                 // TODO: send heart beat every second
@@ -693,7 +777,6 @@ int main(int argc, char *argv[]) {
 
                 codec_data_refresh = false;
             }
-            //fprintf(stderr, "DEBUG: extradata: %d, packet: %d\n", enc_ctx->extradata_size, pkt->size);
 
             // Change nalu start to nalu size
             uint8_t *pd = pkt->data;
@@ -722,14 +805,16 @@ int main(int argc, char *argv[]) {
             }
 
             prepareHeader(pkt->size - first_nalu, 0x00); // type VIDEO_DATA
+            //prepareHeader(pkt->size, 0x00); // type VIDEO_DATA
             sendToOutputs(header_buff, HEADER_BUFF_SIZE);
 
             // Send packet data
             sendToOutputs(&pkt->data[first_nalu], pkt->size - first_nalu);
+            //sendToOutputs(pkt->data, pkt->size);
 
             av_packet_unref(pkt);
         }
-        // ENCODE DONE
+        // WRITE DONE
 
         buffer_copy_done = false;
 
@@ -756,8 +841,12 @@ int main(int argc, char *argv[]) {
 
         wl_frame = zwlr_screencopy_manager_v1_capture_output(screencopy_manager, with_cursor, output);
         zwlr_screencopy_frame_v1_add_listener(wl_frame, &frame_listener, NULL);
+
+        if( use_hw )
+            av_frame_free(&hw_frame);
     } while( wl_display_dispatch(display) != -1 );
 
+close:
     if( output_sockets[0] != 0 ) {
         for( uint8_t i = 0; i < 255; i++ ) {
             if( output_sockets[i] == 0 )
@@ -770,11 +859,13 @@ int main(int argc, char *argv[]) {
     if( output_stdout )
         fclose(output_stdout);
 
-    avcodec_free_context(&enc_ctx);
     av_frame_free(&frame);
+    av_frame_free(&hw_frame);
     av_packet_free(&pkt);
+    avcodec_free_context(&enc_ctx);
+    av_buffer_unref(&hw_device_ctx);
 
     wl_buffer_destroy(buffer.wl_buffer);
 
-    return EXIT_SUCCESS;
+    return err;
 }
