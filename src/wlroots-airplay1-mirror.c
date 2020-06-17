@@ -27,6 +27,7 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <errno.h>
 
 #include <sys/time.h>
@@ -36,7 +37,8 @@
 
 static int opt_output_num = 0;
 
-int output_socket = 0;
+// Multiple output sockets to stream to multiple devices
+int output_sockets[255] = {};
 FILE *output_file = NULL;
 FILE *output_stdout = NULL;
 
@@ -223,7 +225,7 @@ static size_t find0001(const uint8_t *p, size_t left_size) {
             counter++;
         else if( counter == 3 && p[i] == 1 ) {
             return i+1;
-        } else 
+        } else
             counter = 0;
     }
     return -1;
@@ -270,7 +272,7 @@ static size_t prepareAVCCData() {
 
     // TODO: check buffer overload
     memcpy(&avcc_buff[8], sps, sps_size); // data of SPS
-    
+
     size_t pps_begin = 8+sps_size;
     avcc_buff[pps_begin] = 0x01;  // num of PPS
     writeUInt16BE(avcc_buff, pps_begin+1, pps_size);  // 2 bytes for length of PPS in BE
@@ -325,12 +327,22 @@ static void prepareHeader(uint32_t payload_size, uint16_t type) {
 }
 
 static void sendToOutputs(uint8_t *buffer, size_t num_bytes) {
-    if( output_socket != 0 )
-        send(output_socket, buffer, num_bytes, 0);
+    // TODO: parallelize to increase the framerate
+    //struct timespec tm;
+    //clock_gettime( CLOCK_REALTIME, &tm );
+    //int64_t start = tm.tv_nsec + tm.tv_sec * 1000000000;
+    for( uint8_t i = 0; i < 255; i++ ) {
+        if( output_sockets[i] == 0 )
+            break;
+        send(output_sockets[i], buffer, num_bytes, 0);
+    }
     if( output_file )
         fwrite(buffer, 1, num_bytes, output_file);
     if( output_stdout )
         fwrite(buffer, 1, num_bytes, output_stdout);
+    //clock_gettime( CLOCK_REALTIME, &tm );
+    //int64_t end = tm.tv_nsec + tm.tv_sec * 1000000000;
+    //fprintf(stderr, "----> send bytes %li delay: %ldms\n", num_bytes, (end - start) / 1000);
 }
 
 static void initMirroringConnection() {
@@ -376,20 +388,19 @@ static void initMirroringConnection() {
 static const char usage[] =
     "Usage: scrcpy-capture [options...]\n"
     "\n"
-    "  -h              Show help message and quit.\n"
-    "  -o <output_num> Set the output number to capture.\n"
-    "  -a <address>    Send stream to airplay 1.0 device with specified address.\n"
-    "  -p <port>       Send stream to airplay 1.0 device with specified port (default 7100).\n"
-    "  -s              Output stream to stdout.\n"
-    "  -f <file_path>  Output stream to the specified file path.\n"
-    "  -c              Include cursors in the capture.\n";
+    "  -h                     Show help message and quit.\n"
+    "  -o <output_num>        Set the output number to capture.\n"
+    "  -a <addr[:port]>,[...] Send stream to airplay 1.0 device with specified\n"
+    "                         address:port list (separated by comma).\n"
+    "  -s                     Output stream to stdout.\n"
+    "  -f <file_path>         Output stream to the specified file path.\n"
+    "  -c                     Include cursors in the capture.\n";
 
 int main(int argc, char *argv[]) {
     bool write_stdout = false;
     bool with_cursor = false;
     const char *file_path = NULL;
-    const char *airplay_address = NULL;
-    uint16_t airplay_port = 7100;
+    char *airplay_addresses = NULL;
 
     int c;
 
@@ -405,10 +416,7 @@ int main(int argc, char *argv[]) {
             opt_output_num = atoi(optarg);
             break;
         case 'a':
-            airplay_address = optarg;
-            break;
-        case 'p':
-            airplay_port = atoi(optarg);
+            airplay_addresses = optarg;
             break;
         case 's':
             write_stdout = true;
@@ -455,43 +463,72 @@ int main(int argc, char *argv[]) {
         zwlr_screencopy_manager_v1_capture_output(screencopy_manager, with_cursor, output);
     zwlr_screencopy_frame_v1_add_listener(wl_frame, &frame_listener, NULL);
 
-    if( airplay_address ) {
+    if( airplay_addresses ) {
         // TODO: Check MDNS on airplay features and determine mirroring support
-        fprintf(stderr, "INFO: Writing stream to airplay 1.0 device: %s:%d\n", airplay_address, airplay_port);
-        // Create socket
-        if( (output_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0 ) { 
-            fprintf(stderr, "ERROR: Socket creation error\n"); 
-            return -1; 
-        }
-        int yes = 1;
-        if( setsockopt(output_socket, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) == -1 ) {
-            fprintf(stderr, "ERROR: Socket setsockopt TCP_NODELAY error\n");
-            return -1;
-        }
+        char *addr_ptr = strtok(airplay_addresses, ",");
+        uint8_t counter = 0;
+        while( addr_ptr != NULL ) {
+            int port = 7100;
+            char *port_ptr = strchr(addr_ptr, ':');
+            if( port_ptr != NULL ) {
+                port = atoi(&port_ptr[1]);
+                port_ptr[0] = '\0';
+            }
 
-        struct sockaddr_in serv_addr;
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(7100);
-        if( inet_pton(AF_INET, airplay_address, &serv_addr.sin_addr) <= 0 ) {
-            printf("Invalid address or address not supported\n");
-            return -1;
+            fprintf(stderr, "INFO: Writing stream to airplay 1.0 device: %s:%d\n", addr_ptr, port);
+
+            // Create socket
+            if( (output_sockets[counter] = socket(AF_INET, SOCK_STREAM, 0)) < 0 ) {
+                fprintf(stderr, "ERROR: Socket creation error\n");
+                return -1;
+            }
+            int yes = 1;
+            if( setsockopt(output_sockets[counter], IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) == -1 ) {
+                fprintf(stderr, "ERROR: Socket setsockopt TCP_NODELAY error\n");
+                return -1;
+            }
+
+            struct sockaddr_in serv_addr;
+            struct hostent *host;
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_port = htons(port);
+            // Try to parse IPv4
+            if( inet_pton(AF_INET, addr_ptr, &serv_addr.sin_addr) <= 0 ) {
+                // Try to get address from DNS
+                host = gethostbyname(addr_ptr);
+                if( !host ) {
+                    fprintf(stderr, "ERROR: Wrong address %s\n", addr_ptr);
+                    return -1;
+                }
+                memcpy(&serv_addr.sin_addr, host->h_addr_list[0], host->h_length);
+            }
+            // Connect to socket
+            if( connect(output_sockets[counter], (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0 ) {
+                fprintf(stderr, "ERROR: Connection Failed\n");
+                return -1;
+            }
+
+            if( port_ptr != NULL )
+                port_ptr[0] = ':';
+            addr_ptr = strtok(NULL, ",");
+            counter++;
         }
-        // Connect to socket
-        if( connect(output_socket, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0 ) {
-            printf("Connection Failed \n");
-            return -1;
-        }
-    }
+        if( counter < 255 )
+            output_sockets[counter] = 0;
+    } else
+        output_sockets[0] = 0;
+
     if( file_path ) {
         fprintf(stderr, "INFO: Writing stream to file: %s\n", file_path);
         output_file = fopen(file_path, "wb");
     }
+
     if( write_stdout ) {
         fprintf(stderr, "INFO: Writing stream to stdout\n");
         output_stdout = stdout;
     }
 
-    if( !output_file && !output_stdout && output_socket == 0 ) {
+    if( !output_file && !output_stdout && output_sockets[0] == 0 ) {
         fprintf(stderr, "ERROR: No output is specified (check -s, -f, -a)\n");
         exit(1);
     }
@@ -707,7 +744,7 @@ int main(int argc, char *argv[]) {
                 // 50000 = 50msec == 0.05 sec = 20f/s
                 // TODO: add fps option to specify required frames per second
                 int64_t delay = 50000 - (curr_ts - frame_ts)/1000;
-                
+
                 fprintf(stderr, "--> Frame ts: %ld, last_ts: %ld, additional delay: %ld\n", frame_ts, last_ts, delay);
                 if( delay > 0 && delay < 1000000 )
                     usleep(delay);
@@ -721,8 +758,13 @@ int main(int argc, char *argv[]) {
         zwlr_screencopy_frame_v1_add_listener(wl_frame, &frame_listener, NULL);
     } while( wl_display_dispatch(display) != -1 );
 
-    if( output_socket != 0 )
-        close(output_socket);
+    if( output_sockets[0] != 0 ) {
+        for( uint8_t i = 0; i < 255; i++ ) {
+            if( output_sockets[i] == 0 )
+                break;
+            close(output_sockets[i]);
+        }
+    }
     if( output_file )
         fclose(output_file);
     if( output_stdout )
