@@ -71,7 +71,7 @@ Bitcoin wallet: `3Hs7bXdEQ8Uja7RvsA29woA4Bh5d2Tx2sf`
 * Support for AirPlay 2.0
 * Audio embedding
 * Locating the available AirPlay devices using mDNS (zeroconf, bonjour)
-* Use hardware encoding if available (VAAPI)
+* Use hardware encoding if available (VAAPI) https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/vaapi_encode.c
 * Test on the other AirPlay devices
 * Variable FPS option
 
